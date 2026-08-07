@@ -1,10 +1,11 @@
 import { exportPublicJwk, timingSafeEqual, verifyJwt } from "./crypto.js";
 import { InviteService } from "./invite-service.js";
 import { OidcService } from "./oidc-service.js";
+import { handleMicrosoftLogin, handleMicrosoftCallback } from "./microsoft.js";
 
 const TURNSTILE_SITEVERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
-export function createApp({ store, config, turnstileFetch = (...args) => globalThis.fetch(...args) }) {
+export function createApp({ store, config, env, turnstileFetch = (...args) => globalThis.fetch(...args) }) {
   const inviteService = new InviteService(store, { accountDomain: config.accountDomain });
   const oidcService = new OidcService({ store, config });
   const turnstileService = new TurnstileService({ config, turnstileFetch });
@@ -37,6 +38,14 @@ export function createApp({ store, config, turnstileFetch = (...args) => globalT
         if (request.method === "POST" && url.pathname === "/register") {
           return await handleRegister(request, inviteService, oidcService, turnstileService);
         }
+        // ========== 微软登录路由 ==========
+        if (request.method === "GET" && url.pathname === "/auth/microsoft") {
+          return handleMicrosoftLogin(env);
+        }
+        if (request.method === "GET" && url.pathname === "/auth/microsoft/callback") {
+          return await handleMicrosoftCallback(request, env);
+        }
+        // =================================
         if (request.method === "POST" && url.pathname === "/api/login") {
           return await handleApiLogin(request, inviteService, oidcService, config);
         }
@@ -52,9 +61,9 @@ export function createApp({ store, config, turnstileFetch = (...args) => globalT
         if (url.pathname === "/admin/invite-codes") {
           return await handleInviteCodesAdmin(request, store, config);
         }
-        return html("找不到頁面", { status: 404 });
+        return html("找不到页面", { status: 404 });
       } catch (error) {
-        console.error("Worker 請求處理失敗", {
+        console.error("Worker 请求处理失败", {
           path: url.pathname,
           message: getErrorMessage(error)
         });
@@ -71,7 +80,7 @@ function handleAuthorize(url, oidcService, config) {
 
 function handleDirectLogin(_oidcService, config) {
   if (!config.openaiLoginUrl) {
-    throw new Error("缺少必要設定：OPENAI_LOGIN_URL");
+    throw new Error("缺少必要配置：OPENAI_LOGIN_URL");
   }
   return redirectResponse(config.openaiLoginUrl);
 }
@@ -147,7 +156,7 @@ async function handleToken(request, oidcService) {
   const form = await request.formData();
   const grantType = String(form.get("grant_type") ?? "");
   if (grantType !== "authorization_code") {
-    return oauthError("unsupported_grant_type", "只支援 authorization_code", 400);
+    return oauthError("unsupported_grant_type", "仅支持 authorization_code", 400);
   }
 
   const credentials = parseClientCredentials(request, form);
@@ -180,12 +189,12 @@ async function handleUserInfo(request, oidcService, config) {
 
 async function handleApiLogin(request, inviteService, oidcService, config) {
   if (!isAdmin(request, config)) {
-    return json({ error: "未授權" }, { status: 401 });
+    return json({ error: "未授权" }, { status: 401 });
   }
   const body = await request.json();
   const account = body.account;
   if (!account) {
-    return json({ error: "缺少 account 參數" }, { status: 400 });
+    return json({ error: "缺少 account 参数" }, { status: 400 });
   }
   const user = await inviteService.login({ account });
   const authRequest = {
@@ -224,13 +233,13 @@ async function handleApiLogin(request, inviteService, oidcService, config) {
 
 async function handleApiRegister(request, inviteService, oidcService, config) {
   if (!isAdmin(request, config)) {
-    return json({ error: "未授權" }, { status: 401 });
+    return json({ error: "未授权" }, { status: 401 });
   }
   const body = await request.json();
   const account = body.account;
   const inviteCode = body.invite_code;
   if (!account || !inviteCode) {
-    return json({ error: "缺少 account 或 invite_code 參數" }, { status: 400 });
+    return json({ error: "缺少 account 或 invite_code 参数" }, { status: 400 });
   }
   const user = await inviteService.registerWithInvite({
     account,
@@ -273,7 +282,7 @@ async function handleApiRegister(request, inviteService, oidcService, config) {
 
 async function handleInviteCodesAdmin(request, store, config) {
   if (!isAdmin(request, config)) {
-    return json({ error: "未授權" }, { status: 401 });
+    return json({ error: "未授权" }, { status: 401 });
   }
   if (request.method === "POST") {
     const body = await request.json();
@@ -285,9 +294,9 @@ async function handleInviteCodesAdmin(request, store, config) {
     return json(inviteCode, { status: 201 });
   }
   if (request.method === "GET") {
-    return json({ message: "請直接查詢 D1，或用 POST 建立邀請碼。" });
+    return json({ message: "请直接查询 D1，或使用 POST 创建邀请码。" });
   }
-  return json({ error: "方法不允許" }, { status: 405 });
+  return json({ error: "方法不允许" }, { status: 405 });
 }
 
 function parseClientCredentials(request, form) {
@@ -312,7 +321,7 @@ function isAdmin(request, config) {
 
 function requirePrivateJwk(config) {
   if (!config.privateJwk) {
-    throw new Error("缺少必要設定：PRIVATE_JWK");
+    throw new Error("缺少必要配置：PRIVATE_JWK");
   }
   return parsePrivateJwk(config.privateJwk);
 }
@@ -321,14 +330,14 @@ function parsePrivateJwk(value) {
   try {
     const jwk = JSON.parse(value);
     if (!jwk.kid) {
-      throw new Error("PRIVATE_JWK 必須包含 kid");
+      throw new Error("PRIVATE_JWK 必须包含 kid");
     }
     return jwk;
   } catch (error) {
-    if (error.message === "PRIVATE_JWK 必須包含 kid") {
+    if (error.message === "PRIVATE_JWK 必须包含 kid") {
       throw error;
     }
-    throw new Error("PRIVATE_JWK 必須是有效的單行 JSON");
+    throw new Error("PRIVATE_JWK 必须是有效的单行 JSON");
   }
 }
 
@@ -343,14 +352,14 @@ class TurnstileService {
       return;
     }
     if (!this.config.turnstileSiteKey) {
-      throw new Error("缺少必要設定：TURNSTILE_SITE_KEY");
+      throw new Error("缺少必要配置：TURNSTILE_SITE_KEY");
     }
     if (!this.config.turnstileSecretKey) {
-      throw new Error("缺少必要設定：TURNSTILE_SECRET_KEY");
+      throw new Error("缺少必要配置：TURNSTILE_SECRET_KEY");
     }
     const token = String(form.get("cf-turnstile-response") ?? "").trim();
     if (!token) {
-      throw new Error("請先完成 Cloudflare 人機驗證");
+      throw new Error("请先完成 Cloudflare 人机验证");
     }
 
     const body = new FormData();
@@ -366,12 +375,12 @@ class TurnstileService {
       body
     });
     if (!response.ok) {
-      throw new Error("Cloudflare 人機驗證暫時不可用，請稍後再試");
+      throw new Error("Cloudflare 人机验证暂时不可用，请稍后再试");
     }
 
     const result = await response.json();
     if (!result.success) {
-      throw new Error("Cloudflare 人機驗證失敗，請重新驗證後再試");
+      throw new Error("Cloudflare 人机验证失败，请重新验证后再试");
     }
   }
 }
@@ -382,13 +391,13 @@ function getClientIp(request) {
 
 function renderLoginPage(request, config) {
   return renderAuthPage({
-    title: "OpenAI SSO 登入",
-    lead: "請輸入帳號登入。帳號會使用固定信箱域名。",
+    title: "SSO 登录",
+    lead: "请输入账号登录。账号将使用固定邮箱域名。",
     formAction: "/login",
-    buttonText: "登入",
+    buttonText: "登录",
     fields: accountFields(config.accountDomain),
-    switchText: "還沒有帳號？",
-    switchLabel: "前往註冊",
+    switchText: "还没有账号？",
+    switchLabel: "前往注册",
     switchHref: buildAuthLink("/register", request),
     hiddenFields: toHiddenFields(request),
     turnstileSiteKey: config.turnstileSiteKey,
@@ -398,16 +407,16 @@ function renderLoginPage(request, config) {
 
 function renderRegisterPage(request, config) {
   return renderAuthPage({
-    title: "OpenAI SSO 註冊",
-    lead: "請輸入帳號與邀請碼。註冊成功後會直接登入。",
+    title: "SSO 注册",
+    lead: "请输入账号与邀请码。注册成功后会自动登录。",
     formAction: "/register",
-    buttonText: "註冊並登入",
+    buttonText: "注册并登录",
     fields: [
       ...accountFields(config.accountDomain),
-      { label: "邀請碼", name: "invite_code", autocomplete: "one-time-code" }
+      { label: "邀请码", name: "invite_code", autocomplete: "one-time-code" }
     ],
-    switchText: "已有帳號？",
-    switchLabel: "返回登入",
+    switchText: "已有账号？",
+    switchLabel: "返回登录",
     switchHref: buildAuthLink("/authorize", request),
     hiddenFields: toHiddenFields(request),
     turnstileSiteKey: config.turnstileSiteKey,
@@ -429,7 +438,7 @@ function renderAuthPage({
   turnstileAction
 }) {
   return `<!doctype html>
-<html lang="zh-Hant">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -451,6 +460,8 @@ function renderAuthPage({
       --primary-focus: rgba(15, 23, 42, 0.08);
       --accent: #0284c7;
       --shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.04), 0 1px 3px rgba(0, 0, 0, 0.02);
+      --microsoft-blue: #0078d4;
+      --microsoft-blue-hover: #106ebe;
     }
 
     body {
@@ -559,6 +570,37 @@ function renderAuthPage({
       margin: 18px 0 14px;
     }
 
+    .divider {
+      text-align: center;
+      margin-top: 20px;
+      border-top: 1px solid var(--border-color);
+      padding-top: 20px;
+    }
+
+    .divider p {
+      margin: 0 0 12px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    .btn-microsoft {
+      display: inline-block;
+      padding: 10px 30px;
+      background: var(--microsoft-blue);
+      color: #ffffff;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 14px;
+      border: none;
+      transition: background 0.15s ease;
+      cursor: pointer;
+    }
+
+    .btn-microsoft:hover {
+      background: var(--microsoft-blue-hover);
+    }
+
     .hint {
       margin: 24px 0 0;
       text-align: center;
@@ -601,6 +643,10 @@ function renderAuthPage({
       ${renderTurnstile(turnstileSiteKey, turnstileAction)}
       <button type="submit">${escapeHtml(buttonText)}</button>
     </form>
+    <div class="divider">
+      <p>或使用以下方式登录</p>
+      <a href="/auth/microsoft" class="btn-microsoft">🔑 使用微软账号登录</a>
+    </div>
     <p class="hint">${escapeHtml(switchText)} <a href="${escapeHtml(switchHref)}">${escapeHtml(switchLabel)}</a></p>
   </main>
   ${renderTurnstileScript(turnstileSiteKey)}
@@ -609,7 +655,7 @@ function renderAuthPage({
 }
 
 function accountFields(accountDomain) {
-  return [{ type: "account", label: "帳號", name: "account", autocomplete: "username", accountDomain }];
+  return [{ type: "account", label: "账号", name: "account", autocomplete: "username", accountDomain }];
 }
 
 function renderAccountField(field) {
@@ -703,11 +749,11 @@ function errorResponse(error) {
   const message = getErrorMessage(error);
   return html(
     `<!doctype html>
-<html lang="zh-Hant">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>登入失敗</title>
+  <title>登录失败</title>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     
@@ -771,9 +817,9 @@ function errorResponse(error) {
 </head>
 <body>
   <main>
-    <h1>登入失敗</h1>
+    <h1>登录失败</h1>
     <p>${escapeHtml(message)}</p>
-    <a href="javascript:history.back()">返回上一頁</a>
+    <a href="javascript:history.back()">返回上一页</a>
   </main>
 </body>
 </html>`,
@@ -788,7 +834,7 @@ function getErrorMessage(error) {
   if (typeof error === "string" && error.trim()) {
     return error;
   }
-  return "登入處理失敗";
+  return "登录处理失败";
 }
 
 function escapeHtml(value) {
