@@ -7,11 +7,12 @@ export default {
     try {
       const app = createApp({
         store: new D1Store(env.DB),
-        config: loadConfig(env)
+        config: loadConfig(env),
+        env: env  // ← 添加这一行，把 env 传给 createApp
       });
       return await app.fetch(request);
     } catch (error) {
-      console.error("Worker 初始化失敗", {
+      console.error("Worker 初始化失败", {
         message: getErrorMessage(error)
       });
       return configErrorResponse(error);
@@ -23,11 +24,11 @@ function configErrorResponse(error) {
   const message = getErrorMessage(error);
   return new Response(
     `<!doctype html>
-<html lang="zh-Hant">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>設定錯誤</title>
+  <title>配置错误</title>
   <style>
     body {
       margin: 0;
@@ -62,7 +63,7 @@ function configErrorResponse(error) {
 </head>
 <body>
   <main>
-    <h1>設定錯誤</h1>
+    <h1>配置错误</h1>
     <p>${escapeHtml(message)}</p>
   </main>
 </body>
@@ -81,7 +82,7 @@ function getErrorMessage(error) {
   if (typeof error === "string" && error.trim()) {
     return error;
   }
-  return "Worker 初始化失敗";
+  return "Worker 初始化失败";
 }
 
 function escapeHtml(value) {
