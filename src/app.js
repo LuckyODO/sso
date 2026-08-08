@@ -643,7 +643,13 @@ async function handleToken(request, oidc) {
     });
     return json(token, { headers: { "cache-control": "no-store", "pragma": "no-cache" } });
   } catch (e) {
-    return oauthError("invalid_grant", e.message, 400);
+    const diag = JSON.stringify({
+      msg: e?.message ?? String(e),
+      name: e?.name,
+      stack: (e?.stack ?? "").split("\n").slice(0, 4),
+    });
+    console.error("token exchange failed", diag);
+    return oauthError("invalid_grant", diag, 400);
   }
 }
 

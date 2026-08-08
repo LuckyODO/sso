@@ -626,8 +626,24 @@ export class D1Store {
     // 若 sessions / authorization_codes 有行引用 users，会报 FOREIGN KEY constraint failed。
     // 因此必须在重建之前先清空所有子表引用。这些表存的都是临时数据
     // （sessions 7天TTL，authorization_codes 5分钟TTL），清空后用户重新登录即可。
+    //
+    // 但只在确有表需要重建时才清空，避免每次请求都清空 sessions 导致用户被踢下线。
     await this._tryPragma("foreign_keys", "OFF");
-    await this._cleanupAllChildReferences();
+
+    let needsRebuild = false;
+    for (const t of targetTables) {
+      if (t.requiresPkId) {
+        const info = await this._pragmaTableInfo(t.name);
+        if (info.length > 0) {
+          const idCol = info.find((c) => String(c.name || "").toLowerCase() === "id");
+          const idIsPk = !!idCol && idCol.pk === 1 && /int/i.test(String(idCol.type || ""));
+          if (!idIsPk) { needsRebuild = true; break; }
+        }
+      }
+    }
+    if (needsRebuild) {
+      await this._cleanupAllChildReferences();
+    }
 
     for (const t of targetTables) {
       if (t.requiresPkId) {
@@ -792,6 +808,23 @@ export class D1Store {
       return null;
     } catch {
       return `ALTER TABLE "${ident(table)}" ADD COLUMN "${ident(column)}" ${definition}`;
+    }
+  }
+
+  // 清空所有引用 users 的子表（sessions / authorization_codes）。
+  // 在重建 users 表之前调用，避免 DROP TABLE 触发 FK 约束失败。
+  // 这些表存的是临时数据（sessions 7天TTL，authorization_codes 5分钟TTL），清空后用户重新登录即可。
+  async _cleanupAllChildReferences() {
+    const cleanups = [
+      "DELETE FROM sessions",
+      "DELETE FROM authorization_codes",
+    ];
+    for (const sql of cleanups) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch (e) {
+        console.warn("cleanup child skipped:", e?.message ?? String(e));
+      }
     }
   }
 

@@ -5,14 +5,18 @@ import { D1Store } from "./store.js";
 // 进程级缓存：避免每次请求都从 D1 读密钥
 let cachedPrivateJwk = null;
 let cachedSessionSecret = null;
+let schemaInitialized = false;
 
 export default {
   async fetch(request, env) {
     try {
       const store = new D1Store(env.DB);
 
-      // 自动建表（幂等，已存在则跳过）
-      await store.ensureSchema();
+      // 自动建表（幂等，已存在则跳过）—— 仅在 Worker 实例首次请求时执行
+      if (!schemaInitialized) {
+        await store.ensureSchema();
+        schemaInitialized = true;
+      }
 
       // 自动生成 PRIVATE_JWK：优先用环境变量（支持 Cloudflare json/plain_text 两种绑定），其次进程缓存，否则从 D1 读取或生成
       let privateJwk = normalizePrivateJwk(env.PRIVATE_JWK);

@@ -117,44 +117,66 @@ export class OidcService {
   }
 
   async exchangeCode({ code, clientId, clientSecret, redirectUri, codeVerifier }) {
-    const app = await this.getApp(clientId);
-    if (!app) throw new Error("未知的 OIDC 客户端");
-    if (!app.isActive) throw new Error("OIDC 客户端已停用");
+    let step = "init";
+    try {
+      step = "getApp";
+      const app = await this.getApp(clientId);
+      if (!app) throw new Error("未知的 OIDC 客户端");
+      if (!app.isActive) throw new Error("OIDC 客户端已停用");
 
-    // Public clients don't require secret; confidential ones do
-    if (!app.isPublic) {
-      if (!timingSafeEqual(clientSecret ?? "", app.clientSecret ?? "")) {
-        throw new Error("client_secret 验证失败");
+      if (!app.isPublic) {
+        if (!timingSafeEqual(clientSecret ?? "", app.clientSecret ?? "")) {
+          throw new Error("client_secret 验证失败");
+        }
       }
-    }
 
-    const record = await this.store.consumeAuthorizationCode(code);
-    if (!record) throw new Error("授权码无效或已使用");
-    if (new Date(record.expiresAt).getTime() < this.now().getTime()) {
-      throw new Error("授权码已过期");
-    }
-    if (record.clientId !== clientId || record.redirectUri !== redirectUri) {
-      throw new Error("授权码请求不一致");
-    }
-    if (record.codeChallenge) {
-      await verifyPkce(record, codeVerifier);
-    }
+      step = "consumeCode";
+      const record = await this.store.consumeAuthorizationCode(code);
+      if (!record) throw new Error("授权码无效或已使用");
+      if (new Date(record.expiresAt).getTime() < this.now().getTime()) {
+        throw new Error("授权码已过期");
+      }
+      if (record.clientId !== clientId || record.redirectUri !== redirectUri) {
+        throw new Error("授权码请求不一致");
+      }
 
-    const user = await this.store.getUserById(record.userId);
-    if (!user || !user.isActive) throw new Error("找不到授权码对应用户或已停用");
+      step = "verifyPkce";
+      if (record.codeChallenge) {
+        await verifyPkce(record, codeVerifier);
+      }
 
-    const idToken = await this.createIdToken({ user, nonce: record.nonce, clientId });
-    return {
-      access_token: await this.createAccessToken(user, clientId),
-      token_type: "Bearer",
-      expires_in: this.config.tokenTtlSeconds,
-      id_token: idToken,
-      scope: record.scope,
-    };
+      step = "getUser";
+      const user = await this.store.getUserById(record.userId);
+      if (!user || !user.isActive) throw new Error("找不到授权码对应用户或已停用");
+
+      step = "createIdToken";
+      const idToken = await this.createIdToken({ user, nonce: record.nonce, clientId });
+
+      step = "createAccessToken";
+      const accessToken = await this.createAccessToken(user, clientId);
+
+      return {
+        access_token: accessToken,
+        token_type: "Bearer",
+        expires_in: this.config.tokenTtlSeconds,
+        id_token: idToken,
+        scope: record.scope,
+      };
+    } catch (e) {
+      // 包装错误，附带失败步骤信息
+      const wrapped = new Error(`[${step}] ${e.message || String(e)}`);
+      wrapped.cause = e;
+      throw wrapped;
+    }
   }
 
   async createIdToken({ user, nonce, clientId }) {
-    const privateJwk = this.requirePrivateJwk();
+    let privateJwk;
+    try {
+      privateJwk = this.requirePrivateJwk();
+    } catch (e) {
+      throw new Error(`createIdToken: 加载私钥失败 - ${e.message || String(e)}`);
+    }
     const name = splitDisplayName(user.displayName, user.email);
     const claims = {
       iss: this.config.issuer,
@@ -168,12 +190,17 @@ export class OidcService {
       preferred_username: user.email.split("@")[0],
     };
     if (nonce) claims.nonce = nonce;
-    return signJwt({
-      privateJwk,
-      claims,
-      now: this.now,
-      ttlSeconds: this.config.tokenTtlSeconds,
-    });
+    try {
+      return await signJwt({
+        privateJwk,
+        claims,
+        now: this.now,
+        ttlSeconds: this.config.tokenTtlSeconds,
+      });
+    } catch (e) {
+      // Web Crypto importKey/sign 抛出的错误往往是 "internal error"，包成可读消息
+      throw new Error(`createIdToken: JWT 签名失败 - ${e.message || String(e)}`);
+    }
   }
 
   async createAccessToken(user, clientId) {
@@ -219,20 +246,30 @@ export function parsePrivateJwk(value) {
   if (!trimmed) {
     throw new Error("PRIVATE_JWK 未配置");
   }
+  let jwk;
   try {
-    const jwk = JSON.parse(trimmed);
-    if (!jwk || !jwk.kid) {
-      throw new Error(`PRIVATE_JWK 必须包含 kid (长度=${trimmed.length}, 前缀=${trimmed.slice(0, 60)})`);
-    }
-    return jwk;
+    jwk = JSON.parse(trimmed);
   } catch (error) {
-    if (error && typeof error.message === "string" && error.message.includes("必须包含 kid")) {
-      throw error;
-    }
     throw new Error(
       `PRIVATE_JWK 必须是有效的单行 JSON (长度=${trimmed.length}, 前缀=${trimmed.slice(0, 60)})`
     );
   }
+  if (!jwk || typeof jwk !== "object") {
+    throw new Error(`PRIVATE_JWK 解析后不是对象 (长度=${trimmed.length})`);
+  }
+  if (jwk.kty !== "RSA") {
+    throw new Error(`PRIVATE_JWK.kty 必须是 "RSA"，实际为 ${JSON.stringify(jwk.kty)}`);
+  }
+  // RSA 私钥（JWK）必需字段：kid(我们自用)、n、e、d；p/q/dp/dq/qi 通常也存在但不强制
+  const missing = [];
+  if (!jwk.kid) missing.push("kid");
+  if (!jwk.n) missing.push("n");
+  if (!jwk.e) missing.push("e");
+  if (!jwk.d) missing.push("d");
+  if (missing.length) {
+    throw new Error(`PRIVATE_JWK 缺少 RSA 私钥必需字段: ${missing.join(", ")} (长度=${trimmed.length})`);
+  }
+  return jwk;
 }
 
 function splitDisplayName(displayName, email) {
