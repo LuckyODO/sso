@@ -42,6 +42,9 @@ class SqliteAsD1 {
 const tmpPath = ":memory:";
 const rawDb = new DatabaseSync(tmpPath);
 rawDb.exec(`
+  -- 模拟生产环境：先关闭外键约束（旧表创建时 FK 未启用）
+  PRAGMA foreign_keys = OFF;
+
   -- 旧版 users 表：email 当主键，没有 id / display_name / password_hash 等列
   CREATE TABLE users (
     email TEXT PRIMARY KEY,
@@ -55,6 +58,24 @@ rawDb.exec(`
 
   -- 故意留一个空 apps 表（无 id 列，无任何业务列）
   CREATE TABLE apps (client_id TEXT PRIMARY KEY);
+
+  -- 旧版 sessions 表：FK 定义存在但因 users 无 id 列而被忽略，
+  -- user_id 存的是旧的隐式 rowid（重建后会变成孤立引用）
+  CREATE TABLE sessions (
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    email TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  );
+  -- 插入一条引用 user_id=999 的会话（users 重建后这个 id 不存在）
+  INSERT INTO sessions (token, user_id, email, created_at, expires_at, last_seen_at)
+    VALUES ('stale-token', 999, 'ghost@example.com', '2020-01-01T00:00:00Z', '2099-01-01T00:00:00Z', '2020-01-01T00:00:00Z');
+
+  -- 现在开启外键约束（模拟 D1 默认行为，后续 ensureSchema 会遇到 FK 报错）
+  PRAGMA foreign_keys = ON;
 `);
 const d1 = new SqliteAsD1(rawDb);
 const store = new D1Store(d1);
@@ -99,5 +120,9 @@ await store.ensureSchema();
 const alice2 = rawDb.prepare("SELECT id, email FROM users WHERE email='alice@example.com'").get();
 assert.equal(alice2.id, alice.id, "再次迁移不丢数据、id 不变");
 
-console.log("✅ 真实 SQLite 迁移测试通过（旧 users 表无 id → 重建并迁移数据）");
+// 验证孤立会话已被清理（user_id=999 不存在于新 users 表）
+const staleSession = rawDb.prepare("SELECT token FROM sessions WHERE token='stale-token'").get();
+assert.equal(staleSession, undefined, "孤立会话（user_id 不存在）已被清理");
+
+console.log("✅ 真实 SQLite 迁移测试通过（旧 users 表无 id → 重建并迁移数据 + 清理孤立会话）");
 rawDb.close();

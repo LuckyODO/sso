@@ -620,6 +620,12 @@ export class D1Store {
     if (!this.db || typeof this.db.prepare !== "function") {
       throw new Error("D1 数据库绑定缺失。请在 Cloudflare Worker → Settings → D1 Database 绑定一个名称为 DB 的 D1 数据库。");
     }
+
+    // 关键：D1 默认开启外键约束。重建 users 表会让 sessions / authorization_codes
+    // 里的旧 user_id 变成孤立引用，导致后续任何写操作（甚至建索引）触发
+    // FOREIGN KEY constraint failed。迁移期间临时关闭外键约束。
+    await this._tryPragma("foreign_keys", "OFF");
+
     for (const t of targetTables) {
       if (t.requiresPkId) {
         await this._rebuildIfMissingPkId(t);
@@ -640,6 +646,13 @@ export class D1Store {
         }
       }
     }
+
+    // 清理孤立会话/授权码：重建 users 后，旧 user_id 可能已不匹配新表。
+    // 会话是临时数据（7天TTL），清理后用户重新登录即可；授权码5分钟过期，可安全删除。
+    await this._cleanupOrphanedReferences();
+
+    // 重新开启外键约束
+    await this._tryPragma("foreign_keys", "ON");
 
     // Phase D: 索引
     const indexStatements = [
@@ -780,6 +793,35 @@ export class D1Store {
       return null;
     } catch {
       return `ALTER TABLE "${ident(table)}" ADD COLUMN "${ident(column)}" ${definition}`;
+    }
+  }
+
+  // 设置 PRAGMA（如 foreign_keys）。某些 D1 版本/上下文不允许修改部分 PRAGMA，
+  // 失败时静默忽略，不阻断迁移流程。
+  async _tryPragma(name, value) {
+    const safeName = String(name).replace(/[^a-zA-Z0-9_]/g, "");
+    const safeValue = String(value).replace(/[^a-zA-Z0-9_=]/g, "");
+    try {
+      await this.db.prepare(`PRAGMA ${safeName}=${safeValue}`).run();
+    } catch (e) {
+      console.warn(`PRAGMA ${safeName}=${safeValue} 不可用，跳过:`, e?.message ?? String(e));
+    }
+  }
+
+  // 清理 sessions / authorization_codes 中指向不存在用户的孤立行。
+  // 这在 users 表被重建（id 重新分配）后尤其必要，否则开启外键约束会立即报错。
+  async _cleanupOrphanedReferences() {
+    const cleanups = [
+      "DELETE FROM sessions WHERE user_id NOT IN (SELECT id FROM users)",
+      "DELETE FROM authorization_codes WHERE user_id NOT IN (SELECT id FROM users)",
+    ];
+    for (const sql of cleanups) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch (e) {
+        // 表可能刚创建为空或不存在该列，忽略
+        console.warn("cleanup orphan skipped:", e?.message ?? String(e));
+      }
     }
   }
 
