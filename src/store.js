@@ -405,137 +405,254 @@ export class D1Store {
   }
 
   // ----- Schema Auto-Init -----
+  //
+  // 设计目标：兼容以下历史部署状态：
+  //   1) 全新 D1：无任何表 → 直接建表
+  //   2) 旧的「邀请码 + 微软 AAD」时代：只有 users / invite_codes 等表，
+  //      且 users 可能没有 id INTEGER PRIMARY KEY（email 直接当主键）
+  //   3) 本仓库更近期版本：表已存在但缺少部分新增列
+  //
+  // 迁移策略（对每个需要 id INTEGER PRIMARY KEY 的表，即 users / apps / audit_logs）：
+  //   A. PRAGMA table_info 取当前列；若 id 列不存在或不是 PK → 全表重建
+  //      (ALTER old → new__tmp → INSERT ... SELECT → DROP old → RENAME new__tmp)
+  //   B. 否则：CREATE TABLE IF NOT EXISTS 保证新表存在
+  //   C. 对其余列逐列探测，缺失则 ALTER TABLE ADD
+  //   D. 最后统一建索引
   async ensureSchema() {
-    // 注意顺序：
-    //   Phase 1: 只建表（不含 INDEX）—— 旧表存在时列可能不全
-    //   Phase 2: ALTER TABLE 补全缺失列
-    //   Phase 3: 建 INDEX（INDEX 要求列必须已经存在）
-    const tableStatements = [
-      `CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        display_name TEXT NOT NULL,
-        password_hash TEXT,
-        invite_code TEXT,
-        is_admin INTEGER NOT NULL DEFAULT 0,
-        is_active INTEGER NOT NULL DEFAULT 1,
-        email_verified INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL,
-        last_login_at TEXT NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS invite_codes (
-        code TEXT PRIMARY KEY,
-        max_uses INTEGER NOT NULL DEFAULT 100,
-        used_count INTEGER NOT NULL DEFAULT 0,
-        enabled INTEGER NOT NULL DEFAULT 1,
-        created_by TEXT,
-        created_at TEXT NOT NULL,
-        expires_at TEXT
-      )`,
-      `CREATE TABLE IF NOT EXISTS apps (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        client_id TEXT UNIQUE NOT NULL,
-        client_secret TEXT NOT NULL,
-        name TEXT NOT NULL,
-        description TEXT,
-        logo_url TEXT,
-        redirect_uris TEXT NOT NULL,
-        scopes TEXT NOT NULL DEFAULT '["openid","email","profile"]',
-        is_active INTEGER NOT NULL DEFAULT 1,
-        is_public INTEGER NOT NULL DEFAULT 0,
-        created_by TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS sessions (
-        token TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        email TEXT NOT NULL,
-        user_agent TEXT,
-        ip_address TEXT,
-        created_at TEXT NOT NULL,
-        expires_at TEXT NOT NULL,
-        last_seen_at TEXT NOT NULL,
-        FOREIGN KEY (user_id) REFERENCES users(id)
-      )`,
-      `CREATE TABLE IF NOT EXISTS authorization_codes (
-        code TEXT PRIMARY KEY,
-        user_id INTEGER NOT NULL,
-        email TEXT NOT NULL,
-        client_id TEXT NOT NULL,
-        redirect_uri TEXT NOT NULL,
-        scope TEXT NOT NULL,
-        nonce TEXT,
-        code_challenge TEXT,
-        code_challenge_method TEXT,
-        expires_at TEXT NOT NULL,
-        used_at TEXT,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (user_id) REFERENCES users(id)
-      )`,
-      `CREATE TABLE IF NOT EXISTS audit_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        email TEXT,
-        action TEXT NOT NULL,
-        target_type TEXT,
-        target_id TEXT,
-        details TEXT,
-        ip_address TEXT,
-        user_agent TEXT,
-        created_at TEXT NOT NULL
-      )`,
-      `CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      )`,
+    const ident = (s) => `"${String(s).replace(/[^a-zA-Z0-9_]/g, "_")}"`;
+
+    // ---- 目标表定义（含要求的主键列） ----
+    // requiresPkId: true 表示必须存在 id INTEGER PRIMARY KEY，否则需要重建
+    const targetTables = [
+      {
+        name: "users",
+        requiresPkId: true,
+        createSql: `CREATE TABLE __new__ (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          email TEXT UNIQUE NOT NULL,
+          display_name TEXT NOT NULL,
+          password_hash TEXT,
+          invite_code TEXT,
+          is_admin INTEGER NOT NULL DEFAULT 0,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          email_verified INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          last_login_at TEXT NOT NULL
+        )`,
+        columns: {
+          display_name: "TEXT NOT NULL DEFAULT 'User'",
+          password_hash: "TEXT",
+          invite_code: "TEXT",
+          is_admin: "INTEGER NOT NULL DEFAULT 0",
+          is_active: "INTEGER NOT NULL DEFAULT 1",
+          email_verified: "INTEGER NOT NULL DEFAULT 0",
+          created_at: "TEXT NOT NULL DEFAULT ''",
+          last_login_at: "TEXT NOT NULL DEFAULT ''",
+        },
+        legacyDefaults: {
+          // 用于重建时，如果旧行缺列，给一个合理的默认值，比列默认值更贴近语义
+          display_name: (row) => row?.email ? String(row.email).split("@")[0] : "User",
+          created_at: () => new Date(0).toISOString(),
+          last_login_at: () => new Date(0).toISOString(),
+        },
+      },
+      {
+        name: "invite_codes",
+        requiresPkId: false,
+        createSql: `CREATE TABLE IF NOT EXISTS invite_codes (
+          code TEXT PRIMARY KEY,
+          max_uses INTEGER NOT NULL DEFAULT 100,
+          used_count INTEGER NOT NULL DEFAULT 0,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_by TEXT,
+          created_at TEXT NOT NULL,
+          expires_at TEXT
+        )`,
+        columns: {
+          max_uses: "INTEGER NOT NULL DEFAULT 100",
+          used_count: "INTEGER NOT NULL DEFAULT 0",
+          enabled: "INTEGER NOT NULL DEFAULT 1",
+          created_by: "TEXT",
+          created_at: "TEXT NOT NULL DEFAULT ''",
+          expires_at: "TEXT",
+        },
+      },
+      {
+        name: "apps",
+        requiresPkId: true,
+        createSql: `CREATE TABLE __new__ (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          client_id TEXT UNIQUE NOT NULL,
+          client_secret TEXT NOT NULL,
+          name TEXT NOT NULL,
+          description TEXT,
+          logo_url TEXT,
+          redirect_uris TEXT NOT NULL,
+          scopes TEXT NOT NULL DEFAULT '["openid","email","profile"]',
+          is_active INTEGER NOT NULL DEFAULT 1,
+          is_public INTEGER NOT NULL DEFAULT 0,
+          created_by TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`,
+        columns: {
+          client_secret: "TEXT NOT NULL DEFAULT ''",
+          name: "TEXT NOT NULL DEFAULT 'App'",
+          description: "TEXT",
+          logo_url: "TEXT",
+          redirect_uris: "TEXT NOT NULL DEFAULT '[]'",
+          scopes: "TEXT NOT NULL DEFAULT '[\"openid\",\"email\",\"profile\"]'",
+          is_active: "INTEGER NOT NULL DEFAULT 1",
+          is_public: "INTEGER NOT NULL DEFAULT 0",
+          created_by: "TEXT",
+          created_at: "TEXT NOT NULL DEFAULT ''",
+          updated_at: "TEXT NOT NULL DEFAULT ''",
+        },
+        legacyDefaults: {
+          created_at: () => new Date(0).toISOString(),
+          updated_at: () => new Date(0).toISOString(),
+        },
+      },
+      {
+        name: "sessions",
+        requiresPkId: false,
+        createSql: `CREATE TABLE IF NOT EXISTS sessions (
+          token TEXT PRIMARY KEY,
+          user_id INTEGER NOT NULL,
+          email TEXT NOT NULL,
+          user_agent TEXT,
+          ip_address TEXT,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        )`,
+        columns: {
+          user_id: "INTEGER NOT NULL DEFAULT 0",
+          email: "TEXT NOT NULL DEFAULT ''",
+          created_at: "TEXT NOT NULL DEFAULT ''",
+          expires_at: "TEXT NOT NULL DEFAULT ''",
+          last_seen_at: "TEXT NOT NULL DEFAULT ''",
+          user_agent: "TEXT",
+          ip_address: "TEXT",
+        },
+      },
+      {
+        name: "authorization_codes",
+        requiresPkId: false,
+        createSql: `CREATE TABLE IF NOT EXISTS authorization_codes (
+          code TEXT PRIMARY KEY,
+          user_id INTEGER NOT NULL,
+          email TEXT NOT NULL,
+          client_id TEXT NOT NULL,
+          redirect_uri TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          nonce TEXT,
+          code_challenge TEXT,
+          code_challenge_method TEXT,
+          expires_at TEXT NOT NULL,
+          used_at TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        )`,
+        columns: {
+          user_id: "INTEGER NOT NULL DEFAULT 0",
+          email: "TEXT NOT NULL DEFAULT ''",
+          client_id: "TEXT NOT NULL DEFAULT ''",
+          redirect_uri: "TEXT NOT NULL DEFAULT ''",
+          scope: "TEXT NOT NULL DEFAULT ''",
+          nonce: "TEXT",
+          code_challenge: "TEXT",
+          code_challenge_method: "TEXT",
+          expires_at: "TEXT NOT NULL DEFAULT ''",
+          used_at: "TEXT",
+          created_at: "TEXT NOT NULL DEFAULT ''",
+        },
+      },
+      {
+        name: "audit_logs",
+        requiresPkId: true,
+        createSql: `CREATE TABLE __new__ (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id INTEGER,
+          email TEXT,
+          action TEXT NOT NULL,
+          target_type TEXT,
+          target_id TEXT,
+          details TEXT,
+          ip_address TEXT,
+          user_agent TEXT,
+          created_at TEXT NOT NULL
+        )`,
+        columns: {
+          user_id: "INTEGER",
+          email: "TEXT",
+          action: "TEXT NOT NULL DEFAULT ''",
+          target_type: "TEXT",
+          target_id: "TEXT",
+          details: "TEXT",
+          ip_address: "TEXT",
+          user_agent: "TEXT",
+          created_at: "TEXT NOT NULL DEFAULT ''",
+        },
+        legacyDefaults: {
+          created_at: () => new Date(0).toISOString(),
+        },
+      },
+      {
+        name: "settings",
+        requiresPkId: false,
+        createSql: `CREATE TABLE IF NOT EXISTS settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`,
+        columns: {
+          value: "TEXT NOT NULL DEFAULT ''",
+          updated_at: "TEXT NOT NULL DEFAULT ''",
+        },
+      },
     ];
-    for (const sql of tableStatements) {
-      await this.db.prepare(sql).run();
+
+    // Phase A & B: 建表 / 重建表
+    // 注意：当 env.DB 在测试中未绑定时，this.db 可能为 undefined，
+    // 上层 index.js 会统一捕获并渲染配置错误页；这里仅作防御式保护。
+    if (!this.db || typeof this.db.prepare !== "function") {
+      throw new Error("D1 数据库绑定缺失。请在 Cloudflare Worker → Settings → D1 Database 绑定一个名称为 DB 的 D1 数据库。");
+    }
+    for (const t of targetTables) {
+      if (t.requiresPkId) {
+        await this._rebuildIfMissingPkId(t);
+      } else {
+        await this.db.prepare(t.createSql).run();
+      }
     }
 
-    // Phase 2: ALTER TABLE migrations for legacy schemas
-    const migrationMap = [
-      // users 表：旧邀请码模式可能只含 email/invite_code；补上缺失字段
-      ["users", "display_name", "TEXT NOT NULL DEFAULT 'User'"],
-      ["users", "password_hash", "TEXT"],
-      ["users", "invite_code", "TEXT"],
-      ["users", "is_admin", "INTEGER NOT NULL DEFAULT 0"],
-      ["users", "is_active", "INTEGER NOT NULL DEFAULT 1"],
-      ["users", "email_verified", "INTEGER NOT NULL DEFAULT 0"],
-      ["users", "created_at", "TEXT NOT NULL DEFAULT ''"],
-      ["users", "last_login_at", "TEXT NOT NULL DEFAULT ''"],
-      // invite_codes 表：可能是旧列结构
-      ["invite_codes", "max_uses", "INTEGER NOT NULL DEFAULT 100"],
-      ["invite_codes", "used_count", "INTEGER NOT NULL DEFAULT 0"],
-      ["invite_codes", "enabled", "INTEGER NOT NULL DEFAULT 1"],
-      ["invite_codes", "created_by", "TEXT"],
-      ["invite_codes", "created_at", "TEXT NOT NULL DEFAULT ''"],
-      ["invite_codes", "expires_at", "TEXT"],
-    ];
-    for (const [table, column, definition] of migrationMap) {
-      const sql = await this.maybeAlterAddColumn(table, column, definition);
-      if (sql) {
+    // Phase C: ALTER TABLE 补齐缺失列（即使刚重建的表也幂等）
+    for (const t of targetTables) {
+      for (const [col, def] of Object.entries(t.columns)) {
+        const alter = await this._maybeAlterAddColumn(t.name, col, def);
+        if (!alter) continue;
         try {
-          await this.db.prepare(sql).run();
+          await this.db.prepare(alter).run();
         } catch (e) {
-          // "duplicate column name" 表示列已存在，忽略
           if (!String(e.message || "").toLowerCase().includes("duplicate column")) throw e;
         }
       }
     }
 
-    // Phase 3: CREATE INDEX IF NOT EXISTS —— 必须在 ALTER TABLE 之后执行
+    // Phase D: 索引
     const indexStatements = [
       `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
       `CREATE INDEX IF NOT EXISTS idx_users_is_admin ON users(is_admin)`,
+      `CREATE INDEX IF NOT EXISTS idx_invite_codes_code ON invite_codes(code)`,
       `CREATE INDEX IF NOT EXISTS idx_apps_client_id ON apps(client_id)`,
       `CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)`,
       `CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)`,
       `CREATE INDEX IF NOT EXISTS idx_authorization_codes_user_id ON authorization_codes(user_id)`,
       `CREATE INDEX IF NOT EXISTS idx_authorization_codes_expires_at ON authorization_codes(expires_at)`,
       `CREATE INDEX IF NOT EXISTS idx_authorization_codes_client_id ON authorization_codes(client_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_authorization_codes_email ON authorization_codes(email)`,
       `CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
       `CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action)`,
       `CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)`,
@@ -544,15 +661,122 @@ export class D1Store {
       try {
         await this.db.prepare(sql).run();
       } catch (e) {
-        // 索引在缺失列上可能失败（不太可能发生，因为已经过 phase 2），记录并继续
-        console.warn("create index skipped:", sql, e.message);
+        console.warn("create index skipped:", sql, e?.message ?? String(e));
       }
     }
   }
 
+  // 对要求必须有 id INTEGER PRIMARY KEY 的表进行重建（如 users / apps / audit_logs）。
+  // 重建规则：
+  //   - 表不存在 → 直接 CREATE TABLE
+  //   - 表存在但没有 id 列，或 id 列不是 INTEGER PRIMARY KEY → 重命名→建新→数据迁移→删旧→改回
+  //   - 表存在且 id 是正确 PK → 跳过
+  async _rebuildIfMissingPkId({ name, createSql, columns, legacyDefaults }) {
+    const info = await this._pragmaTableInfo(name);
+    if (info.length === 0) {
+      // 表不存在：直接用真实表名创建
+      const realCreate = createSql.replace("CREATE TABLE __new__", `CREATE TABLE IF NOT EXISTS "${name}"`);
+      await this.db.prepare(realCreate).run();
+      return;
+    }
+    const idCol = info.find((c) => String(c.name || "").toLowerCase() === "id");
+    const idIsPk = !!idCol && idCol.pk === 1 && /int/i.test(String(idCol.type || ""));
+    if (idIsPk) {
+      return; // 正常，无需重建
+    }
+
+    const ident = (s) => `"${String(s).replace(/[^a-zA-Z0-9_]/g, "_")}"`;
+    const tmpTable = `${name}__schema_migrate_tmp`;
+    const nowStr = new Date().toISOString();
+
+    // 1. 先删旧的临时表（上次崩溃残留）
+    try { await this.db.prepare(`DROP TABLE IF EXISTS "${tmpTable}"`).run(); } catch {}
+
+    // 2. 建新表到临时名
+    const createTmp = createSql.replace("CREATE TABLE __new__", `CREATE TABLE "${tmpTable}"`);
+    await this.db.prepare(createTmp).run();
+
+    // 3. 复制旧数据
+    //    旧表里有哪些列，我们能直接映射；没有的列用 legacyDefaults 或列默认值。
+    const oldCols = info.map((c) => c.name);
+    const newColDefs = [
+      { name: "id" }, // 始终第一列，AUTOINCREMENT 会自动赋值（让我们传入 NULL）
+      ...Object.keys(columns).map((n) => ({ name: n })),
+    ];
+    // 为了兼容极旧的场景（apps 可能 client_id 也缺等），我们先用 INSERT SELECT
+    // 只选两边都存在的列，其它列用默认值。
+    const shared = newColDefs
+      .map((c) => c.name)
+      .filter((n) => n !== "id" && oldCols.includes(n));
+    // id 传 NULL 让 SQLite 自动编号
+    const insertCols = ["id", ...shared];
+    const selectExpr = ["NULL", ...shared.map((n) => ident(n))];
+    try {
+      await this.db
+        .prepare(
+          `INSERT INTO "${tmpTable}" (${insertCols.map(ident).join(", ")})
+           SELECT ${selectExpr.join(", ")} FROM "${name}"`
+        )
+        .run();
+    } catch (firstErr) {
+      // 若共享列还不够（例如 NOT NULL 无默认值列在旧表缺失则直接 INSERT 失败），
+      // 退化为逐行手动迁移并填充 legacyDefaults。
+      console.warn(`rebuild ${name} shared-cols insert 失败，逐行迁移:`, firstErr?.message ?? String(firstErr));
+      const oldRows = await this.db.prepare(`SELECT * FROM "${name}"`).all();
+      const allNewCols = Object.keys(columns);
+      const placeholders = ["?", ...allNewCols.map(() => "?")].join(", ");
+      const stmt = this.db.prepare(
+        `INSERT INTO "${tmpTable}" (id, ${allNewCols.map(ident).join(", ")}) VALUES (${placeholders})`
+      );
+      const rows = oldRows.results || oldRows;
+      for (const r of rows) {
+        const vals = [null]; // id
+        for (const col of allNewCols) {
+          let v = r[col];
+          if (v === undefined || v === null) {
+            const fn = legacyDefaults?.[col];
+            if (typeof fn === "function") v = fn(r);
+            else v = null;
+          }
+          // 列默认值兜底（NOT NULL 列要避免 NULL）
+          const definition = columns[col] || "";
+          if ((v === undefined || v === null) && /NOT NULL/i.test(definition)) {
+            const m = /DEFAULT\s+('.*?'|\d+)/i.exec(definition);
+            if (m) {
+              const d = m[1];
+              v = d.startsWith("'") ? d.slice(1, -1).replace(/''/g, "'") : Number(d);
+            } else {
+              v = /INTEGER/i.test(definition) ? 0 : /TEXT/i.test(definition) ? "" : null;
+            }
+          }
+          vals.push(v);
+        }
+        try {
+          await stmt.bind(...vals).run();
+        } catch (rowErr) {
+          console.error(`rebuild ${name} 跳过一行:`, rowErr?.message ?? String(rowErr));
+        }
+      }
+    }
+
+    // 4. 替换旧表
+    await this.db.prepare(`DROP TABLE "${name}"`).run();
+    await this.db.prepare(`ALTER TABLE "${tmpTable}" RENAME TO "${name}"`).run();
+    console.warn(`rebuilt table ${name} (migrated ${info.length} legacy columns)`);
+  }
+
+  async _pragmaTableInfo(tableName) {
+    const safe = String(tableName).replace(/[^a-zA-Z0-9_]/g, "_");
+    try {
+      const res = await this.db.prepare(`PRAGMA table_info("${safe}")`).all();
+      return res.results || res || [];
+    } catch {
+      return [];
+    }
+  }
+
   // 返回 ALTER TABLE SQL（当列缺失时）；否则返回 null
-  async maybeAlterAddColumn(table, column, definition) {
-    // 不用双引号引用列名，否则 SQLite 会把它当作字符串常量，SELECT 永远成功
+  async _maybeAlterAddColumn(table, column, definition) {
     const ident = (s) => s.replace(/[^a-zA-Z0-9_]/g, "_");
     try {
       await this.db.prepare(`SELECT ${ident(column)} FROM ${ident(table)} LIMIT 0`).run();
