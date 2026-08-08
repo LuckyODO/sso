@@ -4,3 +4,5 @@ wrangler.deploy.toml
 node_modules/
 .env
 .env.*
+# 独立的 OIDC 测试客户端仓库（拥有自己的 .git）
+sso-test-client/
