@@ -430,14 +430,14 @@ export class D1Store {
         createSql: `CREATE TABLE __new__ (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           email TEXT UNIQUE NOT NULL,
-          display_name TEXT NOT NULL,
+          display_name TEXT NOT NULL DEFAULT 'User',
           password_hash TEXT,
           invite_code TEXT,
           is_admin INTEGER NOT NULL DEFAULT 0,
           is_active INTEGER NOT NULL DEFAULT 1,
           email_verified INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT NOT NULL,
-          last_login_at TEXT NOT NULL
+          created_at TEXT NOT NULL DEFAULT '',
+          last_login_at TEXT NOT NULL DEFAULT ''
         )`,
         columns: {
           display_name: "TEXT NOT NULL DEFAULT 'User'",
@@ -697,51 +697,41 @@ export class D1Store {
     await this.db.prepare(createTmp).run();
 
     // 3. 复制旧数据
-    //    旧表里有哪些列，我们能直接映射；没有的列用 legacyDefaults 或列默认值。
+    //    关键：以「新表实际拥有的列 ∩ 旧表拥有的列」作为可迁移列集合，
+    //    这样 email / client_id 等主键列也会被纳入（它们不在 columns 映射里，但在 createSql 里定义）。
     const oldCols = info.map((c) => c.name);
-    const newColDefs = [
-      { name: "id" }, // 始终第一列，AUTOINCREMENT 会自动赋值（让我们传入 NULL）
-      ...Object.keys(columns).map((n) => ({ name: n })),
-    ];
-    // 为了兼容极旧的场景（apps 可能 client_id 也缺等），我们先用 INSERT SELECT
-    // 只选两边都存在的列，其它列用默认值。
-    const shared = newColDefs
-      .map((c) => c.name)
-      .filter((n) => n !== "id" && oldCols.includes(n));
-    // id 传 NULL 让 SQLite 自动编号
+    const newInfo = await this._pragmaTableInfo(tmpTable);
+    const newCols = newInfo.map((c) => c.name);
+    const shared = newCols.filter((n) => n !== "id" && oldCols.includes(n));
     const insertCols = ["id", ...shared];
     const selectExpr = ["NULL", ...shared.map((n) => ident(n))];
+    let migratedCount = 0;
     try {
-      await this.db
+      const insertRes = await this.db
         .prepare(
           `INSERT INTO "${tmpTable}" (${insertCols.map(ident).join(", ")})
            SELECT ${selectExpr.join(", ")} FROM "${name}"`
         )
         .run();
+      migratedCount = insertRes?.meta?.changes ?? 0;
     } catch (firstErr) {
-      // 若共享列还不够（例如 NOT NULL 无默认值列在旧表缺失则直接 INSERT 失败），
-      // 退化为逐行手动迁移并填充 legacyDefaults。
-      console.warn(`rebuild ${name} shared-cols insert 失败，逐行迁移:`, firstErr?.message ?? String(firstErr));
+      // 退化为逐行迁移：对每一行，旧表有该列就用旧值，否则用 legacyDefaults / 列默认值兜底
+      console.warn(`rebuild ${name} 批量 insert 失败，逐行迁移:`, firstErr?.message ?? String(firstErr));
       const oldRows = await this.db.prepare(`SELECT * FROM "${name}"`).all();
-      const allNewCols = Object.keys(columns);
-      const placeholders = ["?", ...allNewCols.map(() => "?")].join(", ");
-      const stmt = this.db.prepare(
-        `INSERT INTO "${tmpTable}" (id, ${allNewCols.map(ident).join(", ")}) VALUES (${placeholders})`
-      );
       const rows = oldRows.results || oldRows;
       for (const r of rows) {
-        const vals = [null]; // id
-        for (const col of allNewCols) {
+        const vals = [null]; // id 由 AUTOINCREMENT 自动赋值
+        for (const col of shared) {
           let v = r[col];
           if (v === undefined || v === null) {
             const fn = legacyDefaults?.[col];
             if (typeof fn === "function") v = fn(r);
             else v = null;
           }
-          // 列默认值兜底（NOT NULL 列要避免 NULL）
+          // NOT NULL 列兜底
           const definition = columns[col] || "";
           if ((v === undefined || v === null) && /NOT NULL/i.test(definition)) {
-            const m = /DEFAULT\s+('.*?'|\d+)/i.exec(definition);
+            const m = /DEFAULT\s+('(?:[^']|'')*?'|\d+)/i.exec(definition);
             if (m) {
               const d = m[1];
               v = d.startsWith("'") ? d.slice(1, -1).replace(/''/g, "'") : Number(d);
@@ -752,7 +742,14 @@ export class D1Store {
           vals.push(v);
         }
         try {
-          await stmt.bind(...vals).run();
+          const rowRes = await this.db
+            .prepare(
+              `INSERT INTO "${tmpTable}" (${insertCols.map(ident).join(", ")})
+               VALUES (${insertCols.map(() => "?").join(", ")})`
+            )
+            .bind(...vals)
+            .run();
+          if (rowRes?.meta?.changes) migratedCount += 1;
         } catch (rowErr) {
           console.error(`rebuild ${name} 跳过一行:`, rowErr?.message ?? String(rowErr));
         }
@@ -762,7 +759,7 @@ export class D1Store {
     // 4. 替换旧表
     await this.db.prepare(`DROP TABLE "${name}"`).run();
     await this.db.prepare(`ALTER TABLE "${tmpTable}" RENAME TO "${name}"`).run();
-    console.warn(`rebuilt table ${name} (migrated ${info.length} legacy columns)`);
+    console.warn(`rebuilt table ${name} (migrated ${migratedCount} rows, ${shared.length} shared columns)`);
   }
 
   async _pragmaTableInfo(tableName) {
