@@ -2,7 +2,8 @@ import { randomUrlSafe, timingSafeEqual } from "./crypto.js";
 import { normalizeEmail, normalizeInviteCode } from "./store.js";
 
 const encoder = new TextEncoder();
-const ITERATIONS = 600000;
+// Cloudflare Workers 的 Web Crypto API 限制 PBKDF2 迭代次数 ≤ 100000
+const ITERATIONS = 100000;
 const SALT_BYTES = 16;
 const KEY_BYTES = 32;
 const AUTH_COOKIE = "sso_session";

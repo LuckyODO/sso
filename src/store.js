@@ -621,10 +621,13 @@ export class D1Store {
       throw new Error("D1 数据库绑定缺失。请在 Cloudflare Worker → Settings → D1 Database 绑定一个名称为 DB 的 D1 数据库。");
     }
 
-    // 关键：D1 默认开启外键约束。重建 users 表会让 sessions / authorization_codes
-    // 里的旧 user_id 变成孤立引用，导致后续任何写操作（甚至建索引）触发
-    // FOREIGN KEY constraint failed。迁移期间临时关闭外键约束。
+    // 关键：D1 默认开启外键约束（PRAGMA foreign_keys=1），且不允许通过
+    // PRAGMA foreign_keys=OFF 关闭。重建 users 表时 DROP TABLE 会触发隐式 DELETE，
+    // 若 sessions / authorization_codes 有行引用 users，会报 FOREIGN KEY constraint failed。
+    // 因此必须在重建之前先清空所有子表引用。这些表存的都是临时数据
+    // （sessions 7天TTL，authorization_codes 5分钟TTL），清空后用户重新登录即可。
     await this._tryPragma("foreign_keys", "OFF");
+    await this._cleanupAllChildReferences();
 
     for (const t of targetTables) {
       if (t.requiresPkId) {
@@ -647,11 +650,7 @@ export class D1Store {
       }
     }
 
-    // 清理孤立会话/授权码：重建 users 后，旧 user_id 可能已不匹配新表。
-    // 会话是临时数据（7天TTL），清理后用户重新登录即可；授权码5分钟过期，可安全删除。
-    await this._cleanupOrphanedReferences();
-
-    // 重新开启外键约束
+    // 重新开启外键约束（若前面关闭成功的话）
     await this._tryPragma("foreign_keys", "ON");
 
     // Phase D: 索引
