@@ -1,29 +1,42 @@
 export function loadConfig(env = {}) {
   const issuer = requiredUrl(env.ISSUER, "ISSUER").replace(/\/+$/, "");
-  const clientId = required(env.OIDC_CLIENT_ID, "OIDC_CLIENT_ID");
-  const clientSecret = optional(env.OIDC_CLIENT_SECRET);
-  const redirectUris = required(env.ALLOWED_REDIRECT_URIS, "ALLOWED_REDIRECT_URIS")
-    .split(",")
-    .map((uri) => uri.trim())
-    .filter(Boolean);
-  if (redirectUris.length === 0) {
-    throw new Error("ALLOWED_REDIRECT_URIS 至少需要一個 redirect_uri");
-  }
+  const adminEmails = parseList(env.ADMIN_EMAILS);
+  // SESSION_SECRET 优先，其次从其他密钥派生
+  const sessionSecretRaw = env.SESSION_SECRET || env.ADMIN_TOKEN || env.PRIVATE_JWK;
+  const sessionSecret = sessionSecretRaw ? String(sessionSecretRaw).trim() : "";
 
   return {
     issuer,
-    clientId,
-    clientSecret,
-    redirectUris,
-    accountDomain: requiredDomain(env.ACCOUNT_DOMAIN, "ACCOUNT_DOMAIN"),
-    openaiLoginUrl: optionalUrl(env.OPENAI_LOGIN_URL, "OPENAI_LOGIN_URL"),
+    adminEmails,
+    sessionSecret,
     privateJwk: optional(env.PRIVATE_JWK),
     adminToken: optional(env.ADMIN_TOKEN),
     turnstileSiteKey: optional(env.TURNSTILE_SITE_KEY),
     turnstileSecretKey: optional(env.TURNSTILE_SECRET_KEY),
     authorizationCodeTtlSeconds: Number(env.AUTHORIZATION_CODE_TTL_SECONDS ?? 300),
-    tokenTtlSeconds: Number(env.TOKEN_TTL_SECONDS ?? 3600)
+    tokenTtlSeconds: Number(env.TOKEN_TTL_SECONDS ?? 3600),
+    sessionTtlSeconds: Number(env.SESSION_TTL_SECONDS ?? 86400 * 7),
+    // 兼容 ACCOUNT_DOMAIN 和 DEFAULT_ACCOUNT_DOMAIN 两种命名
+    defaultAccountDomain: optionalDomain(env.DEFAULT_ACCOUNT_DOMAIN || env.ACCOUNT_DOMAIN),
+    // 向后兼容：单应用模式
+    legacyClientId: optional(env.OIDC_CLIENT_ID),
+    legacyClientSecret: optional(env.OIDC_CLIENT_SECRET),
+    legacyRedirectUris: parseList(env.ALLOWED_REDIRECT_URIS),
+    openaiLoginUrl: optional(env.OPENAI_LOGIN_URL),
   };
+}
+
+export function isAdminEmail(config, email) {
+  if (!email) return false;
+  const normalized = String(email).toLowerCase().trim();
+  return config.adminEmails.some((admin) => admin.toLowerCase() === normalized);
+}
+
+function parseList(value) {
+  return String(value ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 }
 
 function optional(value) {
@@ -59,10 +72,8 @@ function optionalUrl(value, name) {
   }
 }
 
-function requiredDomain(value, name) {
-  const normalized = required(value, name).toLowerCase().replace(/^@+/, "").replace(/\.+$/, "");
-  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(normalized)) {
-    throw new Error(`${name} 必須是有效域名`);
-  }
-  return normalized;
+function optionalDomain(value) {
+  const normalized = optional(value);
+  if (!normalized) return "";
+  return normalized.toLowerCase().replace(/^@+/, "").replace(/\.+$/, "");
 }
