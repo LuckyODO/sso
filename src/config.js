@@ -1,15 +1,19 @@
 export function loadConfig(env = {}) {
   const issuer = requiredUrl(env.ISSUER, "ISSUER").replace(/\/+$/, "");
   const adminEmails = parseList(env.ADMIN_EMAILS);
+
+  // PRIVATE_JWK 可能是 Cloudflare Dashboard 保存为 JSON 类型（object）
+  const privateJwk = normalizePrivateJwk(env.PRIVATE_JWK);
+
   // SESSION_SECRET 优先，其次从其他密钥派生
-  const sessionSecretRaw = env.SESSION_SECRET || env.ADMIN_TOKEN || env.PRIVATE_JWK;
+  const sessionSecretRaw = env.SESSION_SECRET || env.ADMIN_TOKEN || privateJwk;
   const sessionSecret = sessionSecretRaw ? String(sessionSecretRaw).trim() : "";
 
   return {
     issuer,
     adminEmails,
     sessionSecret,
-    privateJwk: optional(env.PRIVATE_JWK),
+    privateJwk,
     adminToken: optional(env.ADMIN_TOKEN),
     turnstileSiteKey: optional(env.TURNSTILE_SITE_KEY),
     turnstileSecretKey: optional(env.TURNSTILE_SECRET_KEY),
@@ -41,6 +45,24 @@ function parseList(value) {
 
 function optional(value) {
   return String(value ?? "").trim();
+}
+
+// PRIVATE_JWK 绑定在 Cloudflare Dashboard 可能是 JSON 类型（object），也可能是 plain text string
+// - object: 直接 JSON.stringify 成标准字符串
+// - string: trim 后原样返回
+// - 其它: 返回 ""（视为未配置）
+export function normalizePrivateJwk(value) {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  if (value && typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return "";
+    }
+  }
+  return "";
 }
 
 function required(value, name) {

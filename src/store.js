@@ -406,7 +406,11 @@ export class D1Store {
 
   // ----- Schema Auto-Init -----
   async ensureSchema() {
-    const statements = [
+    // 注意顺序：
+    //   Phase 1: 只建表（不含 INDEX）—— 旧表存在时列可能不全
+    //   Phase 2: ALTER TABLE 补全缺失列
+    //   Phase 3: 建 INDEX（INDEX 要求列必须已经存在）
+    const tableStatements = [
       `CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         email TEXT UNIQUE NOT NULL,
@@ -419,8 +423,6 @@ export class D1Store {
         created_at TEXT NOT NULL,
         last_login_at TEXT NOT NULL
       )`,
-      `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
-      `CREATE INDEX IF NOT EXISTS idx_users_is_admin ON users(is_admin)`,
       `CREATE TABLE IF NOT EXISTS invite_codes (
         code TEXT PRIMARY KEY,
         max_uses INTEGER NOT NULL DEFAULT 100,
@@ -445,7 +447,6 @@ export class D1Store {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`,
-      `CREATE INDEX IF NOT EXISTS idx_apps_client_id ON apps(client_id)`,
       `CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL,
@@ -457,8 +458,6 @@ export class D1Store {
         last_seen_at TEXT NOT NULL,
         FOREIGN KEY (user_id) REFERENCES users(id)
       )`,
-      `CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)`,
       `CREATE TABLE IF NOT EXISTS authorization_codes (
         code TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL,
@@ -474,9 +473,6 @@ export class D1Store {
         created_at TEXT NOT NULL,
         FOREIGN KEY (user_id) REFERENCES users(id)
       )`,
-      `CREATE INDEX IF NOT EXISTS idx_authorization_codes_user_id ON authorization_codes(user_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_authorization_codes_expires_at ON authorization_codes(expires_at)`,
-      `CREATE INDEX IF NOT EXISTS idx_authorization_codes_client_id ON authorization_codes(client_id)`,
       `CREATE TABLE IF NOT EXISTS audit_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -489,31 +485,95 @@ export class D1Store {
         user_agent TEXT,
         created_at TEXT NOT NULL
       )`,
-      `CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action)`,
-      `CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)`,
       `CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at TEXT NOT NULL
       )`,
     ];
-    for (const sql of statements) {
+    for (const sql of tableStatements) {
       await this.db.prepare(sql).run();
+    }
+
+    // Phase 2: ALTER TABLE migrations for legacy schemas
+    const migrationMap = [
+      // users 表：旧邀请码模式可能只含 email/invite_code；补上缺失字段
+      ["users", "display_name", "TEXT NOT NULL DEFAULT 'User'"],
+      ["users", "password_hash", "TEXT"],
+      ["users", "invite_code", "TEXT"],
+      ["users", "is_admin", "INTEGER NOT NULL DEFAULT 0"],
+      ["users", "is_active", "INTEGER NOT NULL DEFAULT 1"],
+      ["users", "email_verified", "INTEGER NOT NULL DEFAULT 0"],
+      ["users", "created_at", "TEXT NOT NULL DEFAULT ''"],
+      ["users", "last_login_at", "TEXT NOT NULL DEFAULT ''"],
+      // invite_codes 表：可能是旧列结构
+      ["invite_codes", "max_uses", "INTEGER NOT NULL DEFAULT 100"],
+      ["invite_codes", "used_count", "INTEGER NOT NULL DEFAULT 0"],
+      ["invite_codes", "enabled", "INTEGER NOT NULL DEFAULT 1"],
+      ["invite_codes", "created_by", "TEXT"],
+      ["invite_codes", "created_at", "TEXT NOT NULL DEFAULT ''"],
+      ["invite_codes", "expires_at", "TEXT"],
+    ];
+    for (const [table, column, definition] of migrationMap) {
+      const sql = await this.maybeAlterAddColumn(table, column, definition);
+      if (sql) {
+        try {
+          await this.db.prepare(sql).run();
+        } catch (e) {
+          // "duplicate column name" 表示列已存在，忽略
+          if (!String(e.message || "").toLowerCase().includes("duplicate column")) throw e;
+        }
+      }
+    }
+
+    // Phase 3: CREATE INDEX IF NOT EXISTS —— 必须在 ALTER TABLE 之后执行
+    const indexStatements = [
+      `CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)`,
+      `CREATE INDEX IF NOT EXISTS idx_users_is_admin ON users(is_admin)`,
+      `CREATE INDEX IF NOT EXISTS idx_apps_client_id ON apps(client_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_authorization_codes_user_id ON authorization_codes(user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_authorization_codes_expires_at ON authorization_codes(expires_at)`,
+      `CREATE INDEX IF NOT EXISTS idx_authorization_codes_client_id ON authorization_codes(client_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action)`,
+      `CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)`,
+    ];
+    for (const sql of indexStatements) {
+      try {
+        await this.db.prepare(sql).run();
+      } catch (e) {
+        // 索引在缺失列上可能失败（不太可能发生，因为已经过 phase 2），记录并继续
+        console.warn("create index skipped:", sql, e.message);
+      }
+    }
+  }
+
+  // 返回 ALTER TABLE SQL（当列缺失时）；否则返回 null
+  async maybeAlterAddColumn(table, column, definition) {
+    // 不用双引号引用列名，否则 SQLite 会把它当作字符串常量，SELECT 永远成功
+    const ident = (s) => s.replace(/[^a-zA-Z0-9_]/g, "_");
+    try {
+      await this.db.prepare(`SELECT ${ident(column)} FROM ${ident(table)} LIMIT 0`).run();
+      return null;
+    } catch {
+      return `ALTER TABLE "${ident(table)}" ADD COLUMN "${ident(column)}" ${definition}`;
     }
   }
 
   // ----- Settings -----
   async getSetting(key) {
     const row = await this.db.prepare("SELECT value FROM settings WHERE key = ?").bind(String(key)).first();
-    return row ? row.value : null;
+    return row && row.value !== undefined && row.value !== null ? String(row.value) : null;
   }
 
   async setSetting(key, value) {
     const now = new Date().toISOString();
+    const safeValue = typeof value === "string" ? value : JSON.stringify(value);
     await this.db
       .prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
-      .bind(String(key), String(value), now)
+      .bind(String(key), safeValue, now)
       .run();
   }
 

@@ -1,6 +1,10 @@
 import { createApp } from "./app.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, normalizePrivateJwk } from "./config.js";
 import { D1Store } from "./store.js";
+
+// 进程级缓存：避免每次请求都从 D1 读密钥
+let cachedPrivateJwk = null;
+let cachedSessionSecret = null;
 
 export default {
   async fetch(request, env) {
@@ -10,32 +14,65 @@ export default {
       // 自动建表（幂等，已存在则跳过）
       await store.ensureSchema();
 
-      // 自动生成 PRIVATE_JWK：优先用环境变量，否则从 D1 读取，都没有就生成一个
-      let privateJwk = optionalStr(env.PRIVATE_JWK);
+      // 自动生成 PRIVATE_JWK：优先用环境变量（支持 Cloudflare json/plain_text 两种绑定），其次进程缓存，否则从 D1 读取或生成
+      let privateJwk = normalizePrivateJwk(env.PRIVATE_JWK);
+      if (!privateJwk) privateJwk = cachedPrivateJwk;
       if (!privateJwk) {
-        privateJwk = await store.getSetting("private_jwk");
-        if (!privateJwk) {
-          privateJwk = await generatePrivateJwk();
-          await store.setSetting("private_jwk", privateJwk);
-        }
-        // 把自动生成的 JWK 注入 env，让 loadConfig 能读到
-        env.PRIVATE_JWK = privateJwk;
+        const fromDb = await store.getSetting("private_jwk");
+        privateJwk = isValidJwkStr(fromDb) ? fromDb : null;
       }
+      if (!privateJwk) {
+        privateJwk = await generatePrivateJwk();
+        try { await store.setSetting("private_jwk", privateJwk); } catch {}
+      }
+      cachedPrivateJwk = privateJwk;
+
+      // SESSION_SECRET：同样的优先级
+      let sessionSecret = optionalStr(env.SESSION_SECRET);
+      if (!sessionSecret) sessionSecret = cachedSessionSecret;
+      if (!sessionSecret) {
+        const fromDb = await store.getSetting("session_secret");
+        sessionSecret = fromDb && String(fromDb).trim().length >= 16 ? fromDb : null;
+      }
+      if (!sessionSecret) {
+        sessionSecret = await generateSessionSecret();
+        try { await store.setSetting("session_secret", sessionSecret); } catch {}
+      }
+      cachedSessionSecret = sessionSecret;
+
+      // 构造 config input：env + 自动生成的字段
+      // 注意：Cloudflare Worker env 是只读 Proxy，这里用展开拷贝成 plain object
+      const configEnv = {
+        ...Object.fromEntries(Object.keys(env).map((k) => [k, env[k]])),
+        PRIVATE_JWK: privateJwk,
+        SESSION_SECRET: sessionSecret,
+      };
 
       const app = createApp({
         store,
-        config: loadConfig(env),
-        env: env,
+        config: loadConfig(configEnv),
+        env: configEnv,
       });
       return await app.fetch(request);
     } catch (error) {
       console.error("Worker 初始化失败", {
-        message: getErrorMessage(error)
+        message: getErrorMessage(error),
+        stack: error && error.stack ? error.stack : undefined,
       });
       return configErrorResponse(error);
     }
   }
 };
+
+function isValidJwkStr(value) {
+  if (!value || typeof value !== "string") return false;
+  try {
+    const jwk = JSON.parse(value.trim());
+    return jwk && jwk.kty === "RSA" && jwk.kid && jwk.d && jwk.n;
+  } catch {
+    return false;
+  }
+}
 
 async function generatePrivateJwk() {
   const keyPair = await crypto.subtle.generateKey(
@@ -48,6 +85,12 @@ async function generatePrivateJwk() {
   jwk.alg = "RS256";
   jwk.use = "sig";
   return JSON.stringify(jwk);
+}
+
+async function generateSessionSecret() {
+  const buf = new Uint8Array(48);
+  crypto.getRandomValues(buf);
+  return btoa(String.fromCharCode(...buf));
 }
 
 function optionalStr(value) {

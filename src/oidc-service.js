@@ -215,13 +215,23 @@ export class OidcService {
 }
 
 export function parsePrivateJwk(value) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    throw new Error("PRIVATE_JWK 未配置");
+  }
   try {
-    const jwk = JSON.parse(value);
-    if (!jwk.kid) throw new Error("PRIVATE_JWK 必须包含 kid");
+    const jwk = JSON.parse(trimmed);
+    if (!jwk || !jwk.kid) {
+      throw new Error(`PRIVATE_JWK 必须包含 kid (长度=${trimmed.length}, 前缀=${trimmed.slice(0, 60)})`);
+    }
     return jwk;
   } catch (error) {
-    if (error.message === "PRIVATE_JWK 必须包含 kid") throw error;
-    throw new Error("PRIVATE_JWK 必须是有效的单行 JSON");
+    if (error && typeof error.message === "string" && error.message.includes("必须包含 kid")) {
+      throw error;
+    }
+    throw new Error(
+      `PRIVATE_JWK 必须是有效的单行 JSON (长度=${trimmed.length}, 前缀=${trimmed.slice(0, 60)})`
+    );
   }
 }
 
