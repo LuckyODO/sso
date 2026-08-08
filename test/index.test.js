@@ -73,10 +73,18 @@ describe("Worker 入口設定", () => {
     const mod = await import("../src/index.js");
     const handler = mod.default;
     const env = makeEnv();
-    // Mock DB - D1Store 使用的 db 可能在调用前不会立刻触发 DB
-    // 先调用不需要 DB 的 endpoint：well-known
+    // Mock DB - ensureSchema calls prepare(sql).run() without bind
     env.DB = env.DB || {
-      prepare: () => ({ bind: () => ({ first: async () => null, all: async () => ({ results: [] }), run: async () => ({ meta: { changes: 0, success: true } }) }) })
+      prepare: () => ({
+        bind: () => ({
+          first: async () => null,
+          all: async () => ({ results: [] }),
+          run: async () => ({ meta: { changes: 0, success: true } })
+        }),
+        run: async () => ({ meta: { changes: 0, success: true } }),
+        first: async () => null,
+        all: async () => ({ results: [] }),
+      })
     };
     const resp = await handler.fetch(
       new Request("https://sso.example.com/.well-known/openid-configuration"),

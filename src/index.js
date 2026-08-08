@@ -5,10 +5,27 @@ import { D1Store } from "./store.js";
 export default {
   async fetch(request, env) {
     try {
+      const store = new D1Store(env.DB);
+
+      // 自动建表（幂等，已存在则跳过）
+      await store.ensureSchema();
+
+      // 自动生成 PRIVATE_JWK：优先用环境变量，否则从 D1 读取，都没有就生成一个
+      let privateJwk = optionalStr(env.PRIVATE_JWK);
+      if (!privateJwk) {
+        privateJwk = await store.getSetting("private_jwk");
+        if (!privateJwk) {
+          privateJwk = await generatePrivateJwk();
+          await store.setSetting("private_jwk", privateJwk);
+        }
+        // 把自动生成的 JWK 注入 env，让 loadConfig 能读到
+        env.PRIVATE_JWK = privateJwk;
+      }
+
       const app = createApp({
-        store: new D1Store(env.DB),
+        store,
         config: loadConfig(env),
-        env: env  // ← 添加这一行，把 env 传给 createApp
+        env: env,
       });
       return await app.fetch(request);
     } catch (error) {
@@ -19,6 +36,23 @@ export default {
     }
   }
 };
+
+async function generatePrivateJwk() {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["sign", "verify"]
+  );
+  const jwk = await crypto.subtle.exportKey("jwk", keyPair.privateKey);
+  jwk.kid = "auto-generated";
+  jwk.alg = "RS256";
+  jwk.use = "sig";
+  return JSON.stringify(jwk);
+}
+
+function optionalStr(value) {
+  return String(value ?? "").trim();
+}
 
 function configErrorResponse(error) {
   const message = getErrorMessage(error);
@@ -42,7 +76,7 @@ function configErrorResponse(error) {
       box-sizing: border-box;
     }
     main {
-      width: min(420px, 100%);
+      width: min(520px, 100%);
       background: #ffffff;
       border: 1px solid #e2e8f0;
       border-radius: 12px;
@@ -59,12 +93,23 @@ function configErrorResponse(error) {
       color: #475569;
       line-height: 1.6;
     }
+    code {
+      background: #f1f5f9;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
   </style>
 </head>
 <body>
   <main>
     <h1>配置错误</h1>
     <p>${escapeHtml(message)}</p>
+    <p style="margin-top:16px;font-size:0.875rem;color:#94a3b8">
+      请检查 Cloudflare Worker → Settings → Variables and Secrets 中的环境变量配置。
+      必需变量：<code>ISSUER</code>、<code>ADMIN_EMAILS</code>。
+      <code>PRIVATE_JWK</code> 和 <code>SESSION_SECRET</code> 如未设置将自动生成。
+    </p>
   </main>
 </body>
 </html>`,
